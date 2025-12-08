@@ -1,6 +1,4 @@
-# TEM-Segmentation-EECS-453-Final-Project
-
-# TEM Cell Segmentation with Attention U-Net
+# TEM Cell-Segmentation-EECS-453-Final-Project
 
 This repository contains an Attention U-Net model for multi-class semantic segmentation of Transmission Electron Microscopy (TEM) images. It includes scripts for training the model and running inference on new data.
 
