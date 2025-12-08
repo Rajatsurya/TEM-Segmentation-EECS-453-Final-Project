@@ -1,0 +1,282 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import tifffile
+from pathlib import Path
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+# Path to your saved model weights
+MODEL_PATH = 'best_model.pth' 
+
+# Folder containing images to predict (Change this to test_data_tiff if needed)
+INPUT_FOLDER = './train_data_tiff' 
+OUTPUT_FOLDER = './predictions'
+
+# Model Settings
+NUM_CLASSES = 5
+PATCH_SIZE = 256
+STRIDE = 128  # Overlap for smoother predictions
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Visualization Settings
+CLASS_NAMES = ['Background', 'Blood Vessels', 'Myelinated Axons', 
+               'Unmyelinated Axons', 'Schwann Cells']
+CLASS_COLORS = [
+    [0, 0, 0],        # Background - black
+    [255, 0, 0],      # Blood Vessels - red
+    [0, 255, 0],      # Myelinated Axons - green
+    [0, 0, 255],      # Unmyelinated Axons - blue
+    [255, 255, 0]     # Schwann Cells - yellow
+]
+
+# ============================================================
+# 2. MODEL DEFINITION (Attention U-Net)
+# ============================================================
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
+class AttentionGate(nn.Module):
+    def __init__(self, gate_ch, skip_ch, inter_ch):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_ch, inter_ch, 1, bias=False),
+            nn.BatchNorm2d(inter_ch)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_ch, inter_ch, 1, bias=False),
+            nn.BatchNorm2d(inter_ch)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_ch, 1, 1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+    
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        if g1.shape[2:] != x1.shape[2:]:
+            g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=True)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+class AttentionUNet(nn.Module):
+    def __init__(self, in_channels=1, num_classes=5, features=[64, 128, 256, 512]):
+        super().__init__()
+        self.encoder_blocks = nn.ModuleList()
+        self.decoder_blocks = nn.ModuleList()
+        self.attention_gates = nn.ModuleList()
+        self.upsample_blocks = nn.ModuleList()
+        self.pool = nn.MaxPool2d(2, 2)
+        
+        # Encoder
+        in_ch = in_channels
+        for feature in features:
+            self.encoder_blocks.append(ConvBlock(in_ch, feature))
+            in_ch = feature
+            
+        # Bottleneck
+        self.bottleneck = ConvBlock(features[-1], features[-1] * 2)
+        
+        # Decoder
+        for feature in reversed(features):
+            self.upsample_blocks.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
+            self.attention_gates.append(
+                AttentionGate(feature, feature, feature // 2)
+            )
+            self.decoder_blocks.append(
+                ConvBlock(feature * 2, feature)
+            )
+        
+        self.final_conv = nn.Conv2d(features[0], num_classes, kernel_size=1)
+    
+    def forward(self, x):
+        skip_connections = []
+        for encoder in self.encoder_blocks:
+            x = encoder(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+        
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+        
+        for idx, (upsample, attention, decoder) in enumerate(
+            zip(self.upsample_blocks, self.attention_gates, self.decoder_blocks)
+        ):
+            x = upsample(x)
+            skip = skip_connections[idx]
+            if x.shape != skip.shape:
+                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=True)
+            skip = attention(x, skip)
+            x = torch.cat([skip, x], dim=1)
+            x = decoder(x)
+            
+        return self.final_conv(x)
+
+# ============================================================
+# 3. HELPER FUNCTIONS
+# ============================================================
+def create_colored_mask(class_mask, colors=CLASS_COLORS):
+    """Convert class indices to RGB image."""
+    h, w = class_mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for idx, color in enumerate(colors):
+        rgb[class_mask == idx] = color
+    return rgb
+
+def predict_large_image(model, image, patch_size=256, stride=128, device='cuda'):
+    """
+    Runs sliding window inference on a large image.
+    Automatically handles padding and stitching.
+    """
+    model.eval()
+    h, w = image.shape
+    
+    # Pad image to fit patch size
+    pad_h = (patch_size - (h % patch_size)) % patch_size
+    pad_w = (patch_size - (w % patch_size)) % patch_size
+    image_padded = np.pad(image, ((0, pad_h), (0, pad_w)), mode='reflect')
+    
+    new_h, new_w = image_padded.shape
+    
+    # Accumulators
+    prob_map = np.zeros((NUM_CLASSES, new_h, new_w), dtype=np.float32)
+    count_map = np.zeros((new_h, new_w), dtype=np.float32)
+    
+    # Prepare input tensor
+    img_normalized = image_padded.astype(np.float32) / 255.0
+    
+    # Sliding window
+    with torch.no_grad():
+        for y in tqdm(range(0, new_h - patch_size + 1, stride), desc="    Inference", leave=False):
+            for x in range(0, new_w - patch_size + 1, stride):
+                patch = img_normalized[y:y+patch_size, x:x+patch_size]
+                patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).to(device)
+                
+                output = model(patch_tensor)
+                probs = torch.softmax(output, dim=1).cpu().numpy()[0]
+                
+                prob_map[:, y:y+patch_size, x:x+patch_size] += probs
+                count_map[y:y+patch_size, x:x+patch_size] += 1
+    
+    # Average probabilities
+    avg_probs = prob_map / np.maximum(count_map, 1.0)
+    
+    # Crop back to original size
+    avg_probs = avg_probs[:, :h, :w]
+    
+    # Get final class predictions
+    pred_mask = np.argmax(avg_probs, axis=0)
+    
+    return pred_mask
+
+# ============================================================
+# 4. MAIN EXECUTION
+# ============================================================
+if __name__ == "__main__":
+    print("="*60)
+    print("TEM SEGMENTATION - INFERENCE MODE")
+    print("="*60)
+    
+    # 1. Setup Device
+    print(f"Device: {DEVICE}")
+    
+    # 2. Load Model
+    print("\nLoading Model...")
+    model = AttentionUNet(in_channels=1, num_classes=NUM_CLASSES).to(DEVICE)
+    
+    if os.path.exists(MODEL_PATH):
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+        # Handle case where checkpoint saves 'model_state_dict' or just weights
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✅ Loaded weights from {MODEL_PATH} (Epoch {checkpoint.get('epoch', '?')})")
+        else:
+            model.load_state_dict(checkpoint)
+            print(f"✅ Loaded weights from {MODEL_PATH}")
+    else:
+        print(f"❌ Error: Model file '{MODEL_PATH}' not found!")
+        exit()
+
+    # 3. Prepare Output Directory
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    
+    # 4. Find Images
+    image_path = Path(INPUT_FOLDER)
+    images = sorted(list(image_path.glob("raw_*.tiff")) + list(image_path.glob("raw_*.tif")))
+    
+    if not images:
+        print(f"❌ No images found in {INPUT_FOLDER}")
+        print("   Please check the path or put .tiff files there.")
+        exit()
+        
+    print(f"\nFound {len(images)} images to process.")
+    
+    # 5. Run Inference
+    for img_file in images:
+        print(f"\nProcessing: {img_file.name}...")
+        
+        # Load
+        img = tifffile.imread(str(img_file))
+        if len(img.shape) == 3: img = img[:, :, 0] # Handle multi-channel if present
+        
+        # Predict
+        pred_mask = predict_large_image(model, img, patch_size=PATCH_SIZE, stride=STRIDE, device=DEVICE)
+        
+        # Colorize
+        colored_mask = create_colored_mask(pred_mask)
+        
+        # Save Prediction (Class Indices)
+        out_name = f"pred_{img_file.stem}.tiff"
+        out_path = os.path.join(OUTPUT_FOLDER, out_name)
+        # Convert 0,1,2,3,4 back to original pixel values [0, 50, 100, 150, 200]
+        # Mapping: 0->0, 1->50, 2->100, 3->150, 4->200
+        final_output = (pred_mask * 50).astype(np.uint8) 
+        tifffile.imwrite(out_path, final_output)
+        
+        # Save Visualization (RGB)
+        vis_name = f"vis_{img_file.stem}.png"
+        vis_path = os.path.join(OUTPUT_FOLDER, vis_name)
+        
+        # Plot side-by-side
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[0].imshow(img, cmap='gray')
+        ax[0].set_title(f"Original: {img_file.name}")
+        ax[0].axis('off')
+        
+        ax[1].imshow(colored_mask)
+        ax[1].set_title("Prediction")
+        ax[1].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(vis_path)
+        plt.close()
+        
+        print(f"   -> Saved Mask: {out_path}")
+        print(f"   -> Saved Vis:  {vis_path}")
+
+    print("\n" + "="*60)
+    print("DONE! Check the 'predictions' folder.")
+    print("="*60)
