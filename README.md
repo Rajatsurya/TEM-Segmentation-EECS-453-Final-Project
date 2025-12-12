@@ -1,10 +1,6 @@
 # TEM Cell-Segmentation-EECS-453-Final-Project
 
 This repository contains an Attention U-Net model for multi-class semantic segmentation of Transmission Electron Microscopy (TEM) images. It includes scripts for training the model and running inference on new data.
-# TEM Cell-Segmentation-EECS-453-Final-Project
-
-This repository contains a pre-trained Attention U-Net model for multi-class semantic segmentation of Transmission Electron Microscopy (TEM) images. The provided script allows you to run inference on new data using the trained model.
-
 ## Project Structure
 
 - `run_model.py`: Main executable script for running inference on images.
